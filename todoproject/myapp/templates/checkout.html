@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Checkout</title>
+</head>
+<body>
+    <h2>Checkout</h2>
+    <h4>Total Price: ₹{{ total_price }}</h4>
+    <form id="checkout-form">
+        <button id="checkoutBtn" type="button">Pay with Razorpay</button>
+    </form>
+
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            var options = {
+                "key": "{{ razorpay_key_id }}",
+                "amount": "{{ total_price|floatformat:2|add:"0"|multiply:100 }}",
+                "currency": "INR",
+                "order_id": "{{ razorpay_order_id }}",
+                "handler": function (response) {
+                    alert("Payment successful: " + response.razorpay_payment_id);
+                    window.location.href = "{% url 'payment_success' %}";
+                },
+                "prefill": {
+                    "name": "{{ request.user.first_name }}",
+                    "email": "{{ request.user.email }}"
+                },
+                "theme": {"color": "#3399cc"}
+            };
+
+            var rzp = new Razorpay(options);
+            document.getElementById('checkoutBtn').onclick = function (e) {
+                rzp.open();
+                e.preventDefault();
+            }
+        });
+    </script>
+</body>
+</html>
