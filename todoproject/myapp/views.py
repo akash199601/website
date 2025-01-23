@@ -7,11 +7,12 @@ from django.http import JsonResponse
 from django.conf import settings
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
-from .models import Product, Cart, CartItem
+from .models import Product, Cart, CartItem, Order, OrderItem
 from django.views.decorators.csrf import csrf_exempt
 from . import views
 import json
 import razorpay
+from django.urls import reverse
 
 def signup_login_view(request):
     if request.method == 'POST':
@@ -73,7 +74,8 @@ def handle_login(request):
 def home(request):
     if not request.user.is_authenticated:
         return redirect('signup_login')
-    return render(request, 'home.html')
+    products = Product.objects.all()
+    return render(request, 'home.html', {'products': products})
 
 def logout_view(request):
     logout(request)
@@ -99,11 +101,49 @@ def add_to_cart(request, product_id):
 
     return redirect('cart')  # Redirect to cart page
 
-# View cart
+@login_required
+def update_cart(request, product_id):
+    if request.method == 'POST':
+        quantity = int(request.POST.get('quantity', 1))
+        product = get_object_or_404(Product, id=product_id)
+        cart = Cart.objects.get(user=request.user)
+        cart_item = get_object_or_404(CartItem, cart=cart, product=product)
+        
+        if quantity > 0:
+            cart_item.quantity = quantity
+            cart_item.save()
+        else:
+            cart_item.delete()
+            
+    return redirect('cart')
+
+@login_required
+def remove_from_cart(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+    cart = Cart.objects.get(user=request.user)
+    CartItem.objects.filter(cart=cart, product=product).delete()
+    return redirect('cart')
+
 @login_required
 def cart_view(request):
     cart, _ = Cart.objects.get_or_create(user=request.user)
-    return render(request, 'cart.html', {'cart': cart})
+    
+    # Calculate totals for each item and cart total
+    cart_items = []
+    cart_total = 0
+    for item in cart.items.all():
+        item_total = float(item.product.price) * item.quantity
+        cart_items.append({
+            'item': item,
+            'total': item_total
+        })
+        cart_total += item_total
+    
+    return render(request, 'cart.html', {
+        'cart': cart,
+        'cart_items': cart_items,
+        'cart_total': cart_total
+    })
 
 razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
@@ -111,37 +151,137 @@ razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZOR
 @login_required
 def checkout(request):
     cart, _ = Cart.objects.get_or_create(user=request.user)
-    total_price = sum(item.product.price * item.quantity for item in cart.items.all())
-
-    if total_price == 0:
-        messages.error(request, "Your cart is empty! Add items before checkout.")
-        return redirect("cart")
-
-    try:
-        order = razorpay_client.order.create({
-            "amount": int(total_price * 100),
-            "currency": "INR",
-            "payment_capture": "1",
+    
+    # Calculate totals for each item and cart total
+    cart_items = []
+    cart_total = 0
+    for item in cart.items.all():
+        item_total = float(item.product.price) * item.quantity
+        cart_items.append({
+            'item': item,
+            'total': item_total
         })
+        cart_total += item_total
+    
+    return render(request, 'checkout.html', {
+        'cart_items': cart_items,
+        'cart_total': cart_total
+    })
 
-        return render(request, 'checkout.html', {
-            "cart": cart,
-            "total_price": total_price,
-            "razorpay_order_id": order['id'],
-            "razorpay_key_id": settings.RAZORPAY_KEY_ID,
-            "currency": "INR",
+@login_required
+def process_checkout(request):
+    if request.method == 'POST':
+        # Get form data
+        first_name = request.POST.get('first_name')
+        last_name = request.POST.get('last_name')
+        email = request.POST.get('email')
+        phone = request.POST.get('phone')
+        address = request.POST.get('address')
+        city = request.POST.get('city')
+        pincode = request.POST.get('pincode')
+        
+        # Get cart details
+        cart = Cart.objects.get(user=request.user)
+        cart_total = sum(item.product.price * item.quantity for item in cart.items.all())
+        
+        # Create Razorpay order
+        order_amount = int(cart_total * 100)  # Convert to paisa
+        order_currency = 'INR'
+        
+        # Create Razorpay Order
+        razorpay_order = razorpay_client.order.create({
+            'amount': order_amount,
+            'currency': order_currency
         })
-    except Exception as e:
-        messages.error(request, f"Error creating Razorpay order: {str(e)}")
-        return redirect("cart")
+        
+        # Save order details in session for verification
+        request.session['razorpay_order_id'] = razorpay_order['id']
+        request.session['shipping_details'] = {
+            'first_name': first_name,
+            'last_name': last_name,
+            'email': email,
+            'phone': phone,
+            'address': address,
+            'city': city,
+            'pincode': pincode
+        }
+        
+        # Render payment page
+        return render(request, 'payment.html', {
+            'razorpay_key_id': settings.RAZORPAY_KEY_ID,
+            'razorpay_order_id': razorpay_order['id'],
+            'amount': cart_total,
+            'callback_url': request.build_absolute_uri(reverse('payment_success'))
+        })
+    
+    return redirect('checkout')
 
-# Payment success
 @login_required
 def payment_success(request):
-    cart, _ = Cart.objects.get_or_create(user=request.user)
-    cart.items.all().delete()
-    messages.success(request, "Payment successful! Your order is placed.")
-    return render(request, 'success.html')
+    if request.method == 'POST':
+        razorpay_payment_id = request.POST.get('razorpay_payment_id')
+        razorpay_order_id = request.POST.get('razorpay_order_id')
+        razorpay_signature = request.POST.get('razorpay_signature')
+        
+        # Verify payment signature
+        try:
+            razorpay_client.utility.verify_payment_signature({
+                'razorpay_payment_id': razorpay_payment_id,
+                'razorpay_order_id': razorpay_order_id,
+                'razorpay_signature': razorpay_signature
+            })
+        except Exception:
+            messages.error(request, 'Invalid payment signature')
+            return redirect('payment_cancel')
+        
+        # Get shipping details from session
+        shipping_details = request.session.get('shipping_details', {})
+        
+        # Get cart and calculate total
+        cart = Cart.objects.get(user=request.user)
+        cart_total = sum(item.product.price * item.quantity for item in cart.items.all())
+        
+        # Create order
+        order = Order.objects.create(
+            user=request.user,
+            first_name=shipping_details.get('first_name'),
+            last_name=shipping_details.get('last_name'),
+            email=shipping_details.get('email'),
+            phone=shipping_details.get('phone'),
+            address=shipping_details.get('address'),
+            city=shipping_details.get('city'),
+            pincode=shipping_details.get('pincode'),
+            total_amount=cart_total,
+            payment_id=razorpay_payment_id,
+            order_id=razorpay_order_id,
+            payment_status='completed'
+        )
+        
+        # Create order items
+        for cart_item in cart.items.all():
+            OrderItem.objects.create(
+                order=order,
+                product=cart_item.product,
+                quantity=cart_item.quantity,
+                price=cart_item.product.price * cart_item.quantity
+            )
+        
+        # Clear cart and session data
+        cart.items.all().delete()
+        if 'shipping_details' in request.session:
+            del request.session['shipping_details']
+        if 'razorpay_order_id' in request.session:
+            del request.session['razorpay_order_id']
+        
+        messages.success(request, 'Order placed successfully!')
+        return render(request, 'success.html', {'order': order})
+    
+    return redirect('cart')
+
+@login_required
+def payment_cancel(request):
+    messages.warning(request, 'Payment was cancelled')
+    return redirect('cart')
 
 # Payment cancel view
 def payment_cancel(request):
